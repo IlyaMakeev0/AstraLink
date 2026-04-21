@@ -850,7 +850,7 @@ async fn issue_access_key(
     if !ensure_auth(&headers, &state) {
         return unauthorized();
     }
-    let label = req.customer_label.trim();
+    let label = req.customer_label.trim().to_string();
     if label.is_empty() {
         return (StatusCode::BAD_REQUEST, "customer_label is required").into_response();
     }
@@ -865,29 +865,31 @@ async fn issue_access_key(
     let now = unix_ts();
     let expires_at = now + days * 24 * 3600;
 
-    let conn = match Connection::open(&state.db) {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let tx = match conn.unchecked_transaction() {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    if let Err(e) = tx.execute(
-        "INSERT INTO users(username, psk, enabled, profile, created_at) VALUES (?1, ?2, 1, ?3, ?4)",
-        params![username, psk, profile, now],
-    ) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    let user_id = tx.last_insert_rowid();
-    if let Err(e) = tx.execute(
-        "INSERT INTO access_keys(token, user_id, customer_label, enabled, expires_at, created_at) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-        params![token, user_id, label, expires_at, now],
-    ) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    if let Err(e) = tx.commit() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    {
+        let mut conn = match Connection::open(&state.db) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let tx = match conn.unchecked_transaction() {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        if let Err(e) = tx.execute(
+            "INSERT INTO users(username, psk, enabled, profile, created_at) VALUES (?1, ?2, 1, ?3, ?4)",
+            params![username, psk, profile, now],
+        ) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        let user_id = tx.last_insert_rowid();
+        if let Err(e) = tx.execute(
+            "INSERT INTO access_keys(token, user_id, customer_label, enabled, expires_at, created_at) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+            params![token, user_id, label, expires_at, now],
+        ) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        if let Err(e) = tx.commit() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
     }
     {
         let _guard = state.sync_lock.lock().await;
