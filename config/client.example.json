@@ -1,0 +1,8 @@
+{
+  "server_host": "YOUR_SERVER_IP",
+  "server_port": 8443,
+  "username": "demo",
+  "psk": "replace_with_long_random_psk",
+  "local_socks_host": "127.0.0.1",
+  "local_socks_port": 1080
+}

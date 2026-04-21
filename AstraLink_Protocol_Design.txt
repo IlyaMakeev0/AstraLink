@@ -1,0 +1,142 @@
+﻿Проект: новый VPN-протокол "AstraLink"
+Дата: 2026-04-21
+
+1) Цель протокола
+Сделать гибридный VPN-протокол, который объединяет:
+- Скорость и устойчивость на плохих сетях (как Hysteria2/QUIC-подход)
+- Низкий пинг и быстрый handshаke (как WireGuard/AmneziaWG-семейство)
+- Гибкую кастомизацию транспорта и политик (как VLESS + Xray)
+
+2) Ключевая идея
+AstraLink = 3 слоя:
+- L1 Transport Core: UDP-first транспорт на базе QUIC + резервный режим UDP-native tunnel
+- L2 Security & Obfuscation: криптография с коротким handshake + динамическая маскировка пакетов
+- L3 Policy & Routing Engine: модульная маршрутизация, split/full tunnel, правила по доменам/ASN/приложениям
+
+3) Методы, как совместить плюсы существующих протоколов
+
+3.1 Скорость и стабильность (берем из Hysteria2-подхода)
+- Использовать QUIC как основной транспорт для stream multiplexing без head-of-line blocking между потоками.
+- Встроить адаптивный congestion control профиль:
+  - profile "throughput": BBR-подобный режим для высокой пропускной способности
+  - profile "interactive": delay-aware режим для звонков/игр
+- Реализовать packet pacing + динамические буферы recv/send window.
+- Разделить каналы:
+  - control stream (надежный)
+  - data streams (TCP-over-QUIC)
+  - datagrams (UDP relay/игры/VoIP)
+
+3.2 Маленький пинг (берем из AmneziaWG/WireGuard-подхода)
+- Минимизировать количество раундов handshake (1-RTT, с возможным 0-RTT для повторных сессий).
+- Поддержать session resumption и быстрый re-key без полной пересборки туннеля.
+- Профиль "low-latency first":
+  - приоритет коротких пакетов
+  - DSCP-маркировка (опционально)
+  - ограничение burst для снижения queueing delay
+- Быстрый path migration (смена Wi-Fi/LTE без долгого reconnection).
+
+3.3 Кастомизация и антиблокировки (берем из VLESS + Xray)
+- Плагинная архитектура транспорта:
+  - transport plugins: QUIC-native, WebSocket-over-TLS, gRPC-over-HTTP2, raw-udp-wrap
+  - obfuscation plugins: padding, frame morphing, timing jitter, protocol mimic profiles
+- Гибкие policy-правила:
+  - по домену, гео, ASN, приложению, портам
+  - отдельные policy для TCP/UDP/ICMP
+- Конструктор профилей сервера:
+  - stealth profile (максимальная маскировка)
+  - balanced profile (компромисс)
+  - performance profile (максимум скорости)
+
+3.4 Что добавить сверх существующих
+- Multi-path mode (опционально): параллельные каналы через 2 uplink (например Wi-Fi + LTE).
+- Health-scoring маршрутов в реальном времени: latency, loss, jitter, reorder.
+- Авто-переключение профиля congestion/obfuscation по условиям сети.
+
+4) Предложенный wire-level дизайн
+- Handshake:
+  - ClientHello: version, cipher suites, transport capabilities, profile hint
+  - ServerHello: selected profile, session ticket, anti-replay token
+  - Auth: short-lived credentials (token/ed25519 cert)
+- Data framing:
+  - Frame header: stream_id, frame_type, flags, optional padding length
+  - Optional morphing: переменная длина фреймов + случайное заполнение
+- Re-key:
+  - Таймерный re-key + событийный re-key (при подозрении на активный probing)
+
+5) Сравнение с существующими протоколами
+
+5.1 Краткая таблица
+- Hysteria2:
+  - Плюсы: высокая скорость на нестабильных сетях, QUIC-мультиплексирование, хорошая устойчивость
+  - Минусы: user-space QUIC может быть тяжелее по CPU, фокус больше на throughput
+- AmneziaWG 2.0:
+  - Плюсы: низкая задержка и простота WireGuard-ядра, усиленная обфускация
+  - Минусы: меньше гибкости по сложной маршрутизации и транспортным цепочкам, чем у Xray-экосистемы
+- VLESS + Xray:
+  - Плюсы: максимальная гибкость транспорта/маршрутизации/сценариев деплоя
+  - Минусы: сложность конфигурации и сопровождения выше
+- AstraLink (предлагаемый):
+  - Цель: объединить throughput + low-latency + модульность в одном протоколе
+  - Риск: высокая сложность реализации, нужно строгое профилирование и threat-modeling
+
+5.2 Где AstraLink должен быть лучше
+- В mixed-трафике (браузер + звонки + стрим): ниже jitter, чем у throughput-only профилей.
+- В сложных сетях: стабильнее при смене сети за счет быстрого migration/resumption.
+- В эксплуатации: проще, чем Xray-конструктор вручную, если сделать профильные пресеты.
+
+6) Как реализовывать (практический roadmap)
+
+Этап 0: Спецификация
+- Зафиксировать threat model: DPI, active probing, packet loss, NAT rebinding.
+- Описать протокол в RFC-style (message formats, state machine, errors).
+
+Этап 1: MVP (6-8 недель)
+- Язык: Rust или Go.
+- Реализовать:
+  - базовый QUIC transport
+  - auth + key exchange
+  - TCP tunnel + UDP relay
+  - 2 профиля congestion control
+- Минимальный клиент: CLI + TUN.
+- Минимальный сервер: single-binary daemon.
+
+Этап 2: Low-latency и стабильность
+- Добавить path migration, session resumption, fast re-key.
+- Реализовать adaptive scheduler для small-packet priority.
+- Тесты в netem: 1%, 5%, 10% packet loss; 50-200 ms RTT; jitter spikes.
+
+Этап 3: Кастомизация и плагины
+- Ввести plugin API для transport/obfuscation.
+- Добавить policy engine (domain/app/geo/asn rules).
+- Сделать JSON/YAML конфиг с профилями и валидацией схемы.
+
+Этап 4: Hardening и production
+- Security audit (крипто, replay, downgrade, DoS).
+- Fuzzing wire parser + load testing (10k+ concurrent tunnels).
+- Набор референс-конфигов и автоматический benchmark harness.
+
+7) Технологический стек (рекомендуемый)
+- Core daemon: Rust (безопасность памяти + высокая производительность)
+- Control API: gRPC/REST
+- Config schema: JSON Schema + versioned migrations
+- Crypto: только стандартные примитивы из проверенных библиотек (никакой "самодельной" криптографии)
+
+8) KPI для сравнения в бенчмарках
+- Median RTT under load
+- P95/P99 latency
+- Goodput (Mbps) при 1/5/10% loss
+- Reconnect time при смене сети
+- CPU/RAM на 1000 одновременных клиентов
+
+9) Важные риски
+- Нельзя одновременно "максимальную маскировку" и "максимальную скорость" без динамической адаптации.
+- Сложность плагинов увеличивает поверхность атак.
+- Нужна строгая совместимость версий клиента/сервера и протокольный negotiation.
+
+10) Рекомендуемая стратегия запуска
+- Сначала shipping MVP без сложной обфускации, но с отличной стабильностью и latency.
+- Затем постепенно включать продвинутые obfuscation plugins как опциональные модули.
+- Обязательно вести публичную спецификацию и набор тест-векторов совместимости.
+
+Примечание по позиции проекта:
+AstraLink лучше развивать как открытый протокол со спецификацией и независимыми реализациями клиента/сервера. Это снижает vendor lock-in и ускоряет аудит безопасности.
