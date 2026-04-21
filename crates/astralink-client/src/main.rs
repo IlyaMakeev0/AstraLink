@@ -1,25 +1,31 @@
-use anyhow::{Context, Result};
-use astralink_core::{
-    build_client_hello, unpack_len, verify_server_hello, SecureFramer, CLOSE, DATA, OPEN, OPEN_ERR, OPEN_OK, PING,
-};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use serde::Deserialize;
-use std::collections::HashMap;
+use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Deserialize, Clone)]
 struct ClientConfig {
     server_host: String,
     server_port: u16,
+    server_name: Option<String>,
     username: String,
     psk: String,
     local_socks_host: String,
     local_socks_port: u16,
+    ca_cert_path: Option<String>,
+    quic_alpn: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StreamHello {
+    username: String,
+    psk: String,
+    target: String,
 }
 
 #[derive(Debug, Parser)]
@@ -28,201 +34,165 @@ struct Args {
     config: PathBuf,
 }
 
-#[derive(Debug)]
-struct StreamState {
-    opened: Option<tokio::sync::oneshot::Sender<Result<()>>>,
-    tx: mpsc::Sender<Option<Vec<u8>>>,
-}
-
-#[derive(Debug, Clone)]
-struct Core {
-    writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    framer: Arc<Mutex<SecureFramer>>,
-    streams: Arc<Mutex<HashMap<u32, StreamState>>>,
-    next_id: Arc<Mutex<u32>>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let raw = tokio::fs::read(&args.config)
         .await
         .with_context(|| format!("read config {:?}", args.config))?;
-    let conf: ClientConfig = serde_json::from_slice(&raw).context("parse client json")?;
-    let (core, session_key, mut reader) = connect_core(&conf).await?;
-    println!(
-        "astralink-client connected to {}:{}",
-        conf.server_host, conf.server_port
-    );
-
-    let core_recv = core.clone();
-    tokio::spawn(async move {
-        if let Err(e) = recv_loop(&mut reader, core_recv, session_key).await {
-            eprintln!("recv loop error: {e:#}");
-        }
-    });
-
-    let core_keepalive = core.clone();
-    tokio::spawn(async move {
-        loop {
-            if send_frame(core_keepalive.clone(), PING, 0, b"ping").await.is_err() {
-                break;
-            }
-            sleep(Duration::from_secs(15)).await;
-        }
-    });
+    let conf: ClientConfig = serde_json::from_slice(&raw).context("parse client config")?;
 
     let bind = format!("{}:{}", conf.local_socks_host, conf.local_socks_port);
     let listener = TcpListener::bind(&bind).await?;
-    println!("local SOCKS5 listening on {bind}");
+    println!("astralink-client (QUIC/TLS1.3) SOCKS5 listening on {bind}");
+
+    let endpoint = build_client_endpoint(&conf)?;
+    let server_addr = resolve_addr(&conf.server_host, conf.server_port)?;
+    let server_name = conf
+        .server_name
+        .clone()
+        .unwrap_or_else(|| conf.server_host.clone());
+
+    let conn = endpoint
+        .connect(server_addr, &server_name)
+        .context("connect init")?
+        .await
+        .context("connect handshake")?;
+    println!(
+        "connected QUIC to {}:{} as {}",
+        conf.server_host, conf.server_port, conf.username
+    );
+    let conn = Arc::new(conn);
+    let conf = Arc::new(conf);
+
     loop {
         let (sock, peer) = listener.accept().await?;
-        let core_conn = core.clone();
+        let conn = conn.clone();
+        let conf = conf.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks_conn(sock, core_conn).await {
-                eprintln!("socks client {peer} error: {e:#}");
+            if let Err(e) = handle_socks_conn(sock, conn, conf).await {
+                eprintln!("socks session {peer} failed: {e:#}");
             }
         });
     }
 }
 
-async fn connect_core(
-    conf: &ClientConfig,
-) -> Result<(Core, Vec<u8>, tokio::net::tcp::OwnedReadHalf)> {
-    let stream = TcpStream::connect((conf.server_host.as_str(), conf.server_port)).await?;
-    let (mut rd, mut wr) = stream.into_split();
-    let (hello, client_nonce) = build_client_hello(&conf.username, &conf.psk)?;
-    wr.write_all(&(hello.len() as u32).to_be_bytes()).await?;
-    wr.write_all(&hello).await?;
-    wr.flush().await?;
-
-    let mut pref = [0u8; 4];
-    rd.read_exact(&mut pref).await?;
-    let len = unpack_len(pref)?;
-    let mut server_hello = vec![0u8; len];
-    rd.read_exact(&mut server_hello).await?;
-    let session_key = verify_server_hello(&server_hello, &conf.psk, &client_nonce)?;
-    let core = Core {
-        writer: Arc::new(Mutex::new(wr)),
-        framer: Arc::new(Mutex::new(SecureFramer::new(session_key.clone()))),
-        streams: Arc::new(Mutex::new(HashMap::new())),
-        next_id: Arc::new(Mutex::new(1)),
-    };
-    Ok((core, session_key, rd))
+fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let addr = format!("{host}:{port}");
+    let mut addrs = addr.to_socket_addrs().context("dns resolve failed")?;
+    addrs
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses resolved"))
 }
 
-async fn recv_loop(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-    core: Core,
-    session_key: Vec<u8>,
+fn build_client_endpoint(conf: &ClientConfig) -> Result<Endpoint> {
+    let mut roots = rustls::RootCertStore::empty();
+    let ca_path = conf
+        .ca_cert_path
+        .clone()
+        .unwrap_or_else(|| "config/transport.crt".to_string());
+    let ca_pem = std::fs::read(&ca_path).with_context(|| format!("read ca cert {ca_path}"))?;
+    let certs = rustls_pemfile::certs(&mut ca_pem.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parse ca cert")?;
+    if certs.is_empty() {
+        bail!("no cert in ca_cert_path");
+    }
+    for cert in certs {
+        roots.add(cert)?;
+    }
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![
+        conf.quic_alpn
+            .clone()
+            .unwrap_or_else(|| "astralink/2".to_string())
+            .into_bytes(),
+    ];
+    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
+    let client_cfg = QuinnClientConfig::new(Arc::new(client_crypto));
+
+    let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
+    endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
+}
+
+async fn handle_socks_conn(
+    mut local: TcpStream,
+    conn: Arc<quinn::Connection>,
+    conf: Arc<ClientConfig>,
 ) -> Result<()> {
-    loop {
-        let mut p = [0u8; 4];
-        if reader.read_exact(&mut p).await.is_err() {
-            break;
-        }
-        let len = unpack_len(p)?;
-        let mut body = vec![0u8; len];
-        reader.read_exact(&mut body).await?;
-        let frame = SecureFramer::parse_frame(&session_key, &body)?;
-        let mut open_sender: Option<tokio::sync::oneshot::Sender<Result<()>>> = None;
-        let mut tx_opt: Option<mpsc::Sender<Option<Vec<u8>>>> = None;
-        let mut tx_payload: Option<Vec<u8>> = None;
-        let mut tx_close = false;
-        let mut open_err: Option<String> = None;
-        {
-            let mut map = core.streams.lock().await;
-            if let Some(st) = map.get_mut(&frame.stream_id) {
-                match frame.frame_type {
-                    OPEN_OK => {
-                        open_sender = st.opened.take();
-                    }
-                    OPEN_ERR => {
-                        open_sender = st.opened.take();
-                        tx_opt = Some(st.tx.clone());
-                        open_err = Some(String::from_utf8_lossy(&frame.payload).to_string());
-                    }
-                    DATA => {
-                        tx_opt = Some(st.tx.clone());
-                        tx_payload = Some(frame.payload);
-                    }
-                    CLOSE => {
-                        tx_opt = Some(st.tx.clone());
-                        tx_close = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let had_open_err = open_err.is_some();
-        if let Some(ch) = open_sender {
-            if let Some(msg) = open_err {
-                let _ = ch.send(Err(anyhow::anyhow!(msg)));
-            } else {
-                let _ = ch.send(Ok(()));
-            }
-        }
-        if let Some(tx) = tx_opt {
-            if let Some(payload) = tx_payload {
-                let _ = tx.send(Some(payload)).await;
-            }
-            if tx_close || had_open_err {
-                let _ = tx.send(None).await;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn next_stream_id(core: &Core) -> u32 {
-    let mut id = core.next_id.lock().await;
-    let out = *id;
-    *id = id.wrapping_add(1);
-    out
-}
-
-async fn send_frame(core: Core, frame_type: u8, stream_id: u32, payload: &[u8]) -> Result<()> {
-    let wire = {
-        let mut fr = core.framer.lock().await;
-        fr.build_frame(frame_type, stream_id, payload)
+    let target = socks5_handshake_and_target(&mut local).await?;
+    let (mut send, mut recv) = conn.open_bi().await.context("open quic stream")?;
+    let hello = StreamHello {
+        username: conf.username.clone(),
+        psk: conf.psk.clone(),
+        target,
     };
-    let mut wr = core.writer.lock().await;
-    wr.write_all(&wire).await?;
-    wr.flush().await?;
-    Ok(())
-}
+    let body = serde_json::to_vec(&hello)?;
+    send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    send.write_all(&body).await?;
+    send.flush().await?;
 
-async fn open_stream(core: Core, target: &str) -> Result<(u32, mpsc::Receiver<Option<Vec<u8>>>)> {
-    let sid = next_stream_id(&core).await;
-    let (open_tx, open_rx) = tokio::sync::oneshot::channel::<Result<()>>();
-    let (tx, rx) = mpsc::channel(128);
-    {
-        let mut map = core.streams.lock().await;
-        map.insert(
-            sid,
-            StreamState {
-                opened: Some(open_tx),
-                tx,
-            },
-        );
+    let mut status = [0u8; 1];
+    recv.read_exact(&mut status).await?;
+    let mut err_len = [0u8; 2];
+    recv.read_exact(&mut err_len).await?;
+    let el = u16::from_be_bytes(err_len) as usize;
+    if status[0] != 1 {
+        let mut err = vec![0u8; el];
+        if el > 0 {
+            recv.read_exact(&mut err).await?;
+        }
+        let msg = String::from_utf8_lossy(&err).to_string();
+        bail!("server rejected stream: {msg}");
     }
-    send_frame(core.clone(), OPEN, sid, target.as_bytes()).await?;
-    open_rx.await.context("open stream canceled")??;
-    Ok((sid, rx))
-}
 
-async fn close_stream(core: Core, sid: u32) -> Result<()> {
-    send_frame(core.clone(), CLOSE, sid, b"").await?;
-    let mut map = core.streams.lock().await;
-    map.remove(&sid);
+    local
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    local.flush().await?;
+
+    let (mut lr, mut lw) = local.into_split();
+    let up = async {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = lr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            send.write_all(&buf[..n]).await?;
+            send.flush().await?;
+        }
+        send.finish()?;
+        Result::<()>::Ok(())
+    };
+    let down = async {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = recv.read(&mut buf).await?;
+            let Some(n) = n else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            lw.write_all(&buf[..n]).await?;
+            lw.flush().await?;
+        }
+        lw.shutdown().await?;
+        Result::<()>::Ok(())
+    };
+    tokio::try_join!(up, down)?;
     Ok(())
 }
 
-async fn handle_socks_conn(mut local: TcpStream, core: Core) -> Result<()> {
+async fn socks5_handshake_and_target(local: &mut TcpStream) -> Result<String> {
     let mut head = [0u8; 2];
     local.read_exact(&mut head).await?;
     if head[0] != 5 {
-        anyhow::bail!("only socks5");
+        bail!("only socks5");
     }
     let n_methods = head[1] as usize;
     let mut methods = vec![0u8; n_methods];
@@ -233,9 +203,7 @@ async fn handle_socks_conn(mut local: TcpStream, core: Core) -> Result<()> {
     let mut req = [0u8; 4];
     local.read_exact(&mut req).await?;
     if req[0] != 5 || req[1] != 1 {
-        local.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-        local.flush().await?;
-        anyhow::bail!("only CONNECT");
+        bail!("only CONNECT is supported");
     }
     let host = match req[3] {
         1 => {
@@ -256,46 +224,12 @@ async fn handle_socks_conn(mut local: TcpStream, core: Core) -> Result<()> {
             use std::net::Ipv6Addr;
             Ipv6Addr::from(ip).to_string()
         }
-        _ => anyhow::bail!("unknown atyp"),
+        _ => bail!("unknown atyp"),
     };
     let mut pb = [0u8; 2];
     local.read_exact(&mut pb).await?;
     let port = u16::from_be_bytes(pb);
-    let target = format!("{host}:{port}");
-    let (sid, mut rx) = open_stream(core.clone(), &target).await?;
-    local.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-    local.flush().await?;
-
-    let (mut lr, mut lw) = local.into_split();
-    let core_up = core.clone();
-    let uplink = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = lr.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            send_frame(core_up.clone(), DATA, sid, &buf[..n]).await?;
-        }
-        close_stream(core_up, sid).await?;
-        Result::<()>::Ok(())
-    });
-
-    let downlink = tokio::spawn(async move {
-        while let Some(item) = rx.recv().await {
-            match item {
-                Some(chunk) => {
-                    lw.write_all(&chunk).await?;
-                    lw.flush().await?;
-                }
-                None => break,
-            }
-        }
-        Result::<()>::Ok(())
-    });
-
-    let (u, d) = tokio::join!(uplink, downlink);
-    u??;
-    d??;
-    Ok(())
+    Ok(format!("{host}:{port}"))
 }
+
+use std::net::ToSocketAddrs;

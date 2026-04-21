@@ -1,82 +1,89 @@
-# AstraLink Rust Stack
+# AstraLink v2 (Rust + React + Auto-SSL)
 
-Rust-first implementation of:
-- `astralink-server` (tunnel server)
-- `astralink-client` (local SOCKS5 bridge client)
-- `astralink-panel` (full web panel: auth, users, inbounds, subscriptions)
+Production-oriented VPN control plane stack:
+- Rust protocol core/server/client
+- Rust API panel (`axum + sqlite`)
+- React-based panel UI
+- Automatic HTTPS certificates with Caddy
+- One-command installer with domain prompts
 
-## Architecture
+## Stack
 
 1. `astralink-core`  
-Protocol primitives: handshake, frame format, encryption/MAC framing, control frame IDs.
+Protocol primitives, handshake, framing.
 
 2. `astralink-server`  
-Accepts AstraLink sessions, authenticates users (`username + psk`), multiplexes streams, forwards TCP targets.
+QUIC + TLS1.3 transport server for AstraLink clients.
 
 3. `astralink-client`  
-Connects to server and exposes local SOCKS5 (`127.0.0.1:1080` by default) for apps/system proxy.
+Local SOCKS5 bridge for user devices.
 
 4. `astralink-panel`  
-Rust panel (`axum + sqlite`) with:
-- admin bootstrap/login
-- users CRUD
-- inbounds CRUD
-- subscription links:
-  - `astralink-uri`
-  - `singbox-socks` bridge profile
-- runtime sync into server config and optional service restart
+API + React admin UI:
+- one admin login
+- domain settings
+- automated customer key issuing
+- tokenized subscription links
+- JSON export + JSON download for client import
+- light and dark themes
+- hardened security headers and secure cookies
 
-## Repository Layout
+5. `Caddy`  
+Reverse proxy + automatic Let's Encrypt TLS for panel/subscription domains.
 
-- `Cargo.toml` (workspace)
-- `crates/astralink-core/`
-- `crates/astralink-server/`
-- `crates/astralink-client/`
-- `crates/astralink-panel/`
-- `config/server.example.json`
-- `config/client.example.json`
-- `scripts/deploy.sh`
+## One-Command Install (Recommended)
 
-## Important Notes
-
-1. Current transport is TCP-based tunnel framing (MVP for stability and deployment simplicity).  
-2. For production-grade censorship resistance, add QUIC/UDP transport and external security audit.  
-3. Custom protocol will not be imported natively by most third-party VPN apps until dedicated core plugin is built.
-
-## Local Build (Dev Machine)
+Run on a fresh Ubuntu/Debian server:
 
 ```bash
-cargo build --release -p astralink-server -p astralink-client -p astralink-panel
+bash <(curl -fsSL https://raw.githubusercontent.com/IlyaMakeev0/AstraLink/main/scripts/install.sh)
 ```
 
-## Quick Linux Install (Recommended)
+Installer will ask:
+- panel domain
+- subscription domain
+- optional priority subscription subdomain
+- Let's Encrypt email
+- admin password
 
-From repository root:
+Then it automatically:
+1. installs dependencies (`git/curl/build-essential/pkg-config/caddy`)
+2. installs Rust toolchain (if missing)
+3. clones/updates repo in `/opt/astralink/src`
+4. builds release binaries
+5. creates systemd services
+6. generates QUIC transport cert (`transport.crt/key`) for client pinning/CA trust
+7. configures Caddy with HTTPS for domains
+8. bootstraps admin user
 
-```bash
-chmod +x scripts/deploy.sh
-sudo PUBLIC_HOST=YOUR_SERVER_IP ADMIN_PASSWORD='StrongPassword123' bash scripts/deploy.sh
-```
+## Access
 
-What script does:
-1. Installs Rust toolchain (if missing).
-2. Builds release binaries.
-3. Installs binaries to:
-   - `/opt/astralink/bin/astralink-server`
-   - `/opt/astralink/bin/astralink-client`
-   - `/opt/astralink/bin/astralink-panel`
-4. Creates service files:
-   - `astralink-server.service`
-   - `astralink-panel.service`
-5. Starts and enables services.
-6. Optionally bootstraps admin (if `ADMIN_PASSWORD` set).
+- Panel URL: `https://<panel-domain>`
+- Admin username: `admin` (default)
+- Admin password: value entered during install
+
+## Customer Provisioning Flow
+
+In panel:
+1. Open `Domains & Routing` and verify domain settings.
+2. Use `Automated Key Issuing`:
+   - enter customer label
+   - choose duration (days)
+   - choose profile
+3. Send one of:
+   - subscription URI link
+   - JSON URL
+   - downloadable JSON config
+
+Generated public endpoints are tokenized:
+- `/s/<token>?format=astralink-uri`
+- `/s/<token>?format=singbox-socks`
+- `/s/<token>?format=singbox-socks-download`
 
 ## Services
 
-Check status:
-
 ```bash
-sudo systemctl status astralink-server astralink-panel
+sudo systemctl status astralink-server astralink-panel caddy
 ```
 
 Logs:
@@ -84,86 +91,45 @@ Logs:
 ```bash
 sudo journalctl -u astralink-server -f
 sudo journalctl -u astralink-panel -f
+sudo journalctl -u caddy -f
 ```
 
-## Panel First Login
+## Ports
 
-Panel URL:
+- `80/tcp` (HTTP, ACME challenge + redirect/proxy)
+- `443/tcp` (HTTPS panel/subscriptions)
+- `8443/tcp` (AstraLink QUIC transport, configurable)
 
-```text
-http://SERVER_IP:2096
-```
+## QUIC Client Config Template
 
-If you did not pass `ADMIN_PASSWORD` in deploy:
-
-```bash
-curl -X POST "http://127.0.0.1:2096/api/bootstrap" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"StrongPassword123"}'
-```
-
-Then login from web UI and create users/inbounds.
-
-## Client Connection
-
-Prepare client config from template:
+`config/client.example.json`
 
 ```json
 {
-  "server_host": "YOUR_SERVER_IP",
+  "server_host": "your-subscription-domain.com",
   "server_port": 8443,
-  "username": "demo",
-  "psk": "replace_with_long_random_psk",
+  "server_name": "your-subscription-domain.com",
+  "username": "replace_with_username",
+  "psk": "replace_with_psk",
   "local_socks_host": "127.0.0.1",
-  "local_socks_port": 1080
+  "local_socks_port": 1080,
+  "ca_cert_path": "transport.crt",
+  "quic_alpn": "astralink/2"
 }
 ```
 
-Run client:
+Client must trust the generated `transport.crt`.
+
+## Local build (dev)
 
 ```bash
-./astralink-client --config client.json
+cargo build --release -p astralink-server -p astralink-client -p astralink-panel
 ```
 
-Now local SOCKS5 is available on `127.0.0.1:1080`.
+## Security Notes
 
-## How to Use With Popular Apps
-
-### What works now
-1. Any app that can use local/system SOCKS5 proxy:
-   - point app/system proxy to `127.0.0.1:1080`
-2. Apps that can import a sing-box JSON bridge profile:
-   - use `/api/subscription/<uuid>?format=singbox-socks`
-
-### What needs future work
-1. Direct native `astralink://` import in apps like v2rayTun/HApp/Throne usually needs plugin/core support.
-2. To remove bridge mode, implement a native outbound plugin for sing-box/Xray.
-
-## API Summary
-
-Public/admin endpoints:
-- `POST /api/bootstrap`
-- `POST /api/auth/login`
-- `GET /api/users`
-- `POST /api/users`
-- `PATCH /api/users/:id`
-- `DELETE /api/users/:id`
-- `GET /api/inbounds`
-- `POST /api/inbounds`
-- `PATCH /api/inbounds/:id`
-- `GET /api/subscription/:uuid?format=astralink-uri`
-- `GET /api/subscription/:uuid?format=singbox-socks`
-
-## Production Hardening TODO
-
-1. Replace custom framing crypto with audited AEAD transport stack on QUIC/TLS1.3.
-2. Add replay protection window and stronger key schedule/rotation.
-3. Add rate limits and abuse controls.
-4. Add integration tests, fuzzing, and benchmark suite.
-5. Add multi-inbound runtime and zero-downtime config reload.
-
-## Tested State in This Workspace
-
-This workspace currently does not have Rust toolchain preinstalled, so full `cargo build` was not executed here.  
-Code and deployment pipeline are prepared for Linux host where `deploy.sh` installs Rust automatically.
-
+Before high-scale commercial usage, complete:
+1. external cryptography audit
+2. replay-defense and token-rotation hardening
+3. integration/load tests and abuse controls
+4. anti-DDoS edge protection (WAF + rate limits + geo policy)

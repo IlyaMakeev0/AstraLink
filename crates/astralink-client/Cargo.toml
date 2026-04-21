@@ -9,7 +9,9 @@ authors.workspace = true
 anyhow = "1"
 astralink-core = { path = "../astralink-core" }
 clap = { version = "4", features = ["derive"] }
+quinn = "0.11"
+rustls = "0.23"
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-

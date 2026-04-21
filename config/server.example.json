@@ -1,6 +1,9 @@
 {
   "listen_host": "0.0.0.0",
   "listen_port": 8443,
+  "quic_cert_path": "config/transport.crt",
+  "quic_key_path": "config/transport.key",
+  "quic_alpn": "astralink/2",
   "users": {
     "demo": "replace_with_long_random_psk"
   }

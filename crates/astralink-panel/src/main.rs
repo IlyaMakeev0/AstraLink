@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
@@ -17,6 +18,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use axum::extract::Request;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -36,6 +38,12 @@ struct Args {
     public_host: String,
     #[arg(long, default_value_t = 8443)]
     public_port: u16,
+    #[arg(long, default_value = "")]
+    panel_domain: String,
+    #[arg(long, default_value = "")]
+    subscription_domain: String,
+    #[arg(long, default_value = "")]
+    subscription_sub_domain: String,
 }
 
 #[derive(Clone)]
@@ -45,6 +53,10 @@ struct AppState {
     restart_service: Option<String>,
     public_host: String,
     public_port: u16,
+    panel_port: u16,
+    panel_domain: String,
+    subscription_domain: String,
+    subscription_sub_domain: String,
     // serialize config writes/reloads
     sync_lock: Arc<Mutex<()>>,
 }
@@ -82,6 +94,20 @@ struct SaveInboundReq {
 }
 
 #[derive(Debug, Deserialize)]
+struct SaveSettingsReq {
+    panel_domain: String,
+    subscription_domain: String,
+    subscription_sub_domain: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueAccessReq {
+    customer_label: String,
+    days: i64,
+    profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SubQuery {
     format: Option<String>,
 }
@@ -104,6 +130,26 @@ struct ApiInbound {
     listen_port: u16,
     transport_mode: String,
     enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiSettings {
+    panel_domain: String,
+    subscription_domain: String,
+    subscription_sub_domain: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiAccessKey {
+    id: i64,
+    customer_label: String,
+    token: String,
+    user_id: i64,
+    username: String,
+    enabled: bool,
+    expires_at: i64,
+    created_at: i64,
+    sub_link: String,
 }
 
 fn unix_ts() -> i64 {
@@ -188,6 +234,19 @@ CREATE TABLE IF NOT EXISTS inbounds (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS access_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token TEXT UNIQUE NOT NULL,
+  user_id INTEGER NOT NULL,
+  customer_label TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
 "#,
     )?;
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM inbounds", [], |r| r.get(0))?;
@@ -197,6 +256,18 @@ CREATE TABLE IF NOT EXISTS inbounds (
             params!["main", "0.0.0.0", 8443_i64, unix_ts()],
         )?;
     }
+    let panel_domain = get_setting_conn(&conn, "panel_domain")?.unwrap_or_default();
+    if panel_domain.is_empty() {
+        set_setting_conn(&conn, "panel_domain", "")?;
+    }
+    let sub_domain = get_setting_conn(&conn, "subscription_domain")?.unwrap_or_default();
+    if sub_domain.is_empty() {
+        set_setting_conn(&conn, "subscription_domain", "")?;
+    }
+    let sub_sub_domain = get_setting_conn(&conn, "subscription_sub_domain")?.unwrap_or_default();
+    if sub_sub_domain.is_empty() {
+        set_setting_conn(&conn, "subscription_sub_domain", "")?;
+    }
     Ok(())
 }
 
@@ -204,6 +275,73 @@ fn random_psk() -> String {
     let mut bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut bytes);
     general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn random_short_id() -> String {
+    let mut bytes = [0u8; 6];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    general_purpose::URL_SAFE_NO_PAD.encode(bytes).to_lowercase()
+}
+
+fn get_setting_conn(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT value FROM settings WHERE key=?1",
+        params![key],
+        |r| r.get(0),
+    );
+    match row {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn set_setting_conn(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn resolve_public_base_url(state: &AppState, conn: &Connection) -> String {
+    let sub_sub_domain = get_setting_conn(conn, "subscription_sub_domain")
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !sub_sub_domain.is_empty() {
+        return format!("https://{sub_sub_domain}");
+    }
+    let sub_domain = get_setting_conn(conn, "subscription_domain")
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !sub_domain.is_empty() {
+        return format!("https://{sub_domain}");
+    }
+    format!("http://{}:{}", state.public_host, state.panel_port)
+}
+
+fn apply_default_domains(state: &AppState) -> Result<()> {
+    let conn = Connection::open(&state.db)?;
+    if !state.panel_domain.trim().is_empty() {
+        set_setting_conn(&conn, "panel_domain", state.panel_domain.trim())?;
+    }
+    if !state.subscription_domain.trim().is_empty() {
+        set_setting_conn(&conn, "subscription_domain", state.subscription_domain.trim())?;
+    }
+    if !state.subscription_sub_domain.trim().is_empty() {
+        set_setting_conn(
+            &conn,
+            "subscription_sub_domain",
+            state.subscription_sub_domain.trim(),
+        )?;
+    }
+    Ok(())
 }
 
 fn maybe_restart_service(service: &Option<String>) {
@@ -277,11 +415,39 @@ async fn page_login() -> impl IntoResponse {
     Html(LOGIN_HTML)
 }
 
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains; preload"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self' https://unpkg.com; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://unpkg.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        ),
+    );
+    resp
+}
+
 async fn page_app(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
     if !ensure_auth(&headers, &state) {
         return unauthorized();
     }
-    Html(APP_HTML).into_response()
+    Html(REACT_APP_HTML).into_response()
 }
 
 async fn bootstrap(State(state): State<AppState>, Json(req): Json<BootstrapReq>) -> impl IntoResponse {
@@ -335,7 +501,9 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> impl
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     let mut headers = HeaderMap::new();
-    let cookie = format!("astrapanel_session={token}; HttpOnly; Path=/; Max-Age=1209600");
+    let cookie = format!(
+        "astrapanel_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=1209600"
+    );
     if let Ok(val) = HeaderValue::from_str(&cookie) {
         headers.insert(header::SET_COOKIE, val);
     }
@@ -572,6 +740,211 @@ async fn patch_inbound(
     Json(json!({"ok": true})).into_response()
 }
 
+async fn get_settings(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
+    if !ensure_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let payload = ApiSettings {
+        panel_domain: get_setting_conn(&conn, "panel_domain")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        subscription_domain: get_setting_conn(&conn, "subscription_domain")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        subscription_sub_domain: get_setting_conn(&conn, "subscription_sub_domain")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    };
+    Json(payload).into_response()
+}
+
+async fn save_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<SaveSettingsReq>,
+) -> impl IntoResponse {
+    if !ensure_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = set_setting_conn(&conn, "panel_domain", req.panel_domain.trim()) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if let Err(e) = set_setting_conn(&conn, "subscription_domain", req.subscription_domain.trim()) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if let Err(e) = set_setting_conn(
+        &conn,
+        "subscription_sub_domain",
+        req.subscription_sub_domain.trim(),
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
+async fn list_access_keys(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
+    if !ensure_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let base = resolve_public_base_url(&state, &conn);
+    let mut stmt = match conn.prepare(
+        r#"
+SELECT k.id, k.customer_label, k.token, k.user_id, u.username, k.enabled, k.expires_at, k.created_at
+FROM access_keys k
+JOIN users u ON u.id = k.user_id
+ORDER BY k.id DESC
+"#,
+    ) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok(ApiAccessKey {
+            id: r.get(0)?,
+            customer_label: r.get(1)?,
+            token: r.get(2)?,
+            user_id: r.get(3)?,
+            username: r.get(4)?,
+            enabled: r.get::<_, i64>(5)? == 1,
+            expires_at: r.get(6)?,
+            created_at: r.get(7)?,
+            sub_link: String::new(),
+        })
+    }) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(mut key) => {
+                key.sub_link = format!("{}/s/{}?format=astralink-uri", base, key.token);
+                out.push(key);
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    }
+    Json(out).into_response()
+}
+
+async fn issue_access_key(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<IssueAccessReq>,
+) -> impl IntoResponse {
+    if !ensure_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let label = req.customer_label.trim();
+    if label.is_empty() {
+        return (StatusCode::BAD_REQUEST, "customer_label is required").into_response();
+    }
+    let days = req.days.clamp(1, 3650);
+    let profile = req
+        .profile
+        .filter(|p| ["balanced", "performance", "stealth"].contains(&p.as_str()))
+        .unwrap_or_else(|| "balanced".to_string());
+    let username = format!("cl_{}", random_short_id());
+    let psk = random_psk();
+    let token = random_psk();
+    let now = unix_ts();
+    let expires_at = now + days * 24 * 3600;
+
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let tx = match conn.unchecked_transaction() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = tx.execute(
+        "INSERT INTO users(username, psk, enabled, profile, created_at) VALUES (?1, ?2, 1, ?3, ?4)",
+        params![username, psk, profile, now],
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let user_id = tx.last_insert_rowid();
+    if let Err(e) = tx.execute(
+        "INSERT INTO access_keys(token, user_id, customer_label, enabled, expires_at, created_at) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+        params![token, user_id, label, expires_at, now],
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if let Err(e) = tx.commit() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    {
+        let _guard = state.sync_lock.lock().await;
+        if let Err(e) = write_runtime_config(&state) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        maybe_restart_service(&state.restart_service);
+    }
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let base = resolve_public_base_url(&state, &conn);
+    Json(json!({
+        "ok": true,
+        "token": token,
+        "customer_label": label,
+        "expires_at": expires_at,
+        "subscription_uri": format!("{}/s/{}?format=astralink-uri", base, token),
+        "subscription_json": format!("{}/s/{}?format=singbox-socks", base, token),
+        "subscription_json_download": format!("{}/s/{}?format=singbox-socks-download", base, token)
+    }))
+    .into_response()
+}
+
+async fn delete_access_key(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if !ensure_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let user_id: rusqlite::Result<i64> =
+        conn.query_row("SELECT user_id FROM access_keys WHERE id=?1", params![id], |r| r.get(0));
+    let uid = match user_id {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::NOT_FOUND, "key not found").into_response(),
+    };
+    if let Err(e) = conn.execute("DELETE FROM access_keys WHERE id=?1", params![id]) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let _ = conn.execute("UPDATE users SET enabled=0 WHERE id=?1", params![uid]);
+    {
+        let _guard = state.sync_lock.lock().await;
+        if let Err(e) = write_runtime_config(&state) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        maybe_restart_service(&state.restart_service);
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
 async fn subscription(
     Path(user_uuid): Path<String>,
     Query(q): Query<SubQuery>,
@@ -637,6 +1010,80 @@ async fn subscription(
     (StatusCode::NOT_FOUND, "user not found").into_response()
 }
 
+async fn subscription_by_token(
+    Path(token): Path<String>,
+    Query(q): Query<SubQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let fmt = q.format.unwrap_or_else(|| "astralink-uri".to_string());
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let now = unix_ts();
+    let row: rusqlite::Result<(String, String, String, i64, i64, i64)> = conn.query_row(
+        r#"
+SELECT u.username, u.psk, u.profile, u.enabled, k.enabled, k.expires_at
+FROM access_keys k
+JOIN users u ON u.id = k.user_id
+WHERE k.token=?1
+"#,
+        params![token],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    );
+    let (username, psk, profile, user_enabled, key_enabled, expires_at) = match row {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::NOT_FOUND, "subscription not found").into_response(),
+    };
+    if user_enabled != 1 || key_enabled != 1 || now > expires_at {
+        return (StatusCode::FORBIDDEN, "subscription expired or disabled").into_response();
+    }
+    if fmt == "astralink-uri" {
+        let raw = json!({
+            "host": state.public_host,
+            "port": state.public_port,
+            "username": username,
+            "psk": psk,
+            "profile": profile
+        });
+        let token = general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&raw).unwrap_or_default());
+        let uri = format!("astralink://{token}#{username}");
+        return (StatusCode::OK, uri).into_response();
+    }
+    let cfg = json!({
+        "log": {"level": "warn"},
+        "outbounds": [{
+            "type": "socks",
+            "tag": "astralink-local",
+            "server": "127.0.0.1",
+            "server_port": 1080,
+            "version": "5"
+        }],
+        "route": {"auto_detect_interface": true, "final": "astralink-local"}
+    });
+    if fmt == "singbox-socks" {
+        return Json(cfg).into_response();
+    }
+    if fmt == "singbox-socks-download" {
+        let body = match serde_json::to_vec_pretty(&cfg) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&format!("attachment; filename=\"astralink-{}.json\"", username))
+                .unwrap_or(HeaderValue::from_static("attachment")),
+        );
+        return (StatusCode::OK, headers, body).into_response();
+    }
+    (StatusCode::BAD_REQUEST, "unknown format").into_response()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -651,10 +1098,15 @@ async fn main() -> Result<()> {
         },
         public_host: args.public_host,
         public_port: args.public_port,
+        panel_port: args.port,
+        panel_domain: args.panel_domain,
+        subscription_domain: args.subscription_domain,
+        subscription_sub_domain: args.subscription_sub_domain,
         sync_lock: Arc::new(Mutex::new(())),
     };
     {
         let _guard = state.sync_lock.lock().await;
+        apply_default_domains(&state)?;
         write_runtime_config(&state)?;
     }
     let app = Router::new()
@@ -666,7 +1118,12 @@ async fn main() -> Result<()> {
         .route("/api/users/:id", patch(patch_user).delete(delete_user))
         .route("/api/inbounds", get(list_inbounds).post(save_inbound))
         .route("/api/inbounds/:id", patch(patch_inbound))
+        .route("/api/settings", get(get_settings).post(save_settings))
+        .route("/api/access-keys", get(list_access_keys).post(issue_access_key))
+        .route("/api/access-keys/:id", delete(delete_access_key))
         .route("/api/subscription/:uuid", get(subscription))
+        .route("/s/:token", get(subscription_by_token))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state);
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
@@ -701,41 +1158,88 @@ async function login(){
 }
 </script></body></html>"#;
 
-const APP_HTML: &str = r#"<!doctype html>
+const REACT_APP_HTML: &str = r#"<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>AstraPanel</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <style>
-:root { --bg:#f6f9fc; --card:#fff; --line:#d8e0ea; --accent:#0a5ccf; }
-body{font-family:Segoe UI,sans-serif;background:var(--bg);margin:0}
-.top{background:linear-gradient(100deg,#0b4fa8,#2086ff);color:#fff;padding:18px}
-.wrap{max-width:1100px;margin:18px auto;padding:0 14px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
-table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #edf2f7;padding:8px;text-align:left}
-input,select{padding:8px;border:1px solid #cbd5e1;border-radius:8px;margin-right:6px;margin-bottom:6px}
-button{padding:8px 10px;border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
-code{font-size:12px;word-break:break-all}.row{display:flex;gap:8px;flex-wrap:wrap}
+:root{--bg:#f4f8fb;--line:#d9e2ec;--card:#fff;--text:#0f172a;--muted:#64748b;--accent:#0a5ccf;--ok:#177d3b;--danger:#b42318}
+body[data-theme='dark']{--bg:#0b1220;--line:#1f2a3d;--card:#111a2b;--text:#e5edf8;--muted:#97a9c3;--accent:#3b82f6;--ok:#22c55e;--danger:#ef4444}
+*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,Segoe UI,system-ui;background:var(--bg);color:var(--text)}
+.hero{background:linear-gradient(120deg,#0a418e,#1f7aff);color:#fff;padding:20px}
+.hero h1{margin:0;font-size:30px}.hero p{margin:8px 0 0;opacity:.9}
+.shell{max-width:1280px;margin:14px auto;padding:0 14px;display:grid;grid-template-columns:1.2fr 1fr;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 3px 12px rgba(15,23,42,.04)}
+.card h2{margin:0 0 10px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input,select{padding:9px 10px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}
+button{padding:9px 12px;border:0;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer;font-weight:600}
+button.alt{background:#334155}button.ok{background:var(--ok)}button.danger{background:var(--danger)}
+table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #edf2f7;padding:8px;text-align:left;vertical-align:top;font-size:13px}
+code{font-size:12px;word-break:break-all}.muted{font-size:12px;color:var(--muted)}
+.full{grid-column:1 / span 2}.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px}
+.pill.ok{background:#e7f7ee;color:#106a30}.pill.off{background:#fdecec;color:#8f1f1f}
 </style></head><body>
-<div class="top"><h1 style="margin:0">AstraPanel</h1><div>AstraLink control plane</div></div>
-<div class="wrap">
-<div class="card"><h2>Users</h2>
-<div class="row"><input id="u_name" placeholder="username"/><input id="u_psk" placeholder="psk (optional)"/>
-<select id="u_profile"><option value="balanced">balanced</option><option value="performance">performance</option><option value="stealth">stealth</option></select>
-<button onclick="addUser()">Add</button></div><table id="users"></table></div>
-<div class="card"><h2>Inbounds</h2>
-<div class="row"><input id="i_tag" placeholder="tag (main)"/><input id="i_host" placeholder="listen host" value="0.0.0.0"/>
-<input id="i_port" placeholder="port" value="8443"/><button onclick="addInbound()">Save</button></div><table id="inbounds"></table></div>
-<div class="card" style="grid-column:1/span 2;"><h2>Subscriptions</h2><div id="subs"></div></div></div>
-<script>
-async function api(path,method='GET',body=null){const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):null});if(!r.ok) throw new Error(await r.text());const ct=r.headers.get('content-type')||'';if(ct.includes('application/json'))return await r.json();return await r.text();}
-async function loadAll(){const users=await api('/api/users');const inbounds=await api('/api/inbounds');
-document.getElementById('users').innerHTML='<tr><th>User</th><th>PSK</th><th>Profile</th><th>Enabled</th><th>Actions</th></tr>'+users.map(u=>`<tr><td>${u.username}</td><td><code>${u.psk}</code></td><td>${u.profile}</td><td>${u.enabled?'yes':'no'}</td><td><button onclick="toggleUser(${u.id},${u.enabled?0:1})">${u.enabled?'Disable':'Enable'}</button><button onclick="delUser(${u.id})">Delete</button></td></tr>`).join('');
-document.getElementById('inbounds').innerHTML='<tr><th>Tag</th><th>Listen</th><th>Mode</th><th>Enabled</th><th>Action</th></tr>'+inbounds.map(i=>`<tr><td>${i.tag}</td><td>${i.listen_host}:${i.listen_port}</td><td>${i.transport_mode}</td><td>${i.enabled?'yes':'no'}</td><td><button onclick="toggleInbound(${i.id},${i.enabled?0:1})">${i.enabled?'Disable':'Enable'}</button></td></tr>`).join('');
-document.getElementById('subs').innerHTML=users.map(u=>`<div style="padding:8px;border-bottom:1px solid #edf2f7;"><b>${u.username}</b><br/><code>/api/subscription/${u.uuid}?format=astralink-uri</code><br/><code>/api/subscription/${u.uuid}?format=singbox-socks</code></div>`).join('');}
-async function addUser(){await api('/api/users','POST',{username:document.getElementById('u_name').value.trim(),psk:document.getElementById('u_psk').value.trim(),profile:document.getElementById('u_profile').value});document.getElementById('u_name').value='';document.getElementById('u_psk').value='';await loadAll();}
-async function delUser(id){await api('/api/users/'+id,'DELETE');await loadAll();}
-async function toggleUser(id,enabled){await api('/api/users/'+id,'PATCH',{enabled});await loadAll();}
-async function addInbound(){await api('/api/inbounds','POST',{tag:document.getElementById('i_tag').value.trim()||'main',listen_host:document.getElementById('i_host').value.trim()||'0.0.0.0',listen_port:Number(document.getElementById('i_port').value.trim()||'8443'),transport_mode:'tcp'});await loadAll();}
-async function toggleInbound(id,enabled){await api('/api/inbounds/'+id,'PATCH',{enabled});await loadAll();}
-loadAll().catch(e=>alert(e.message));
+<div id="root"></div>
+<script type="text/babel">
+const {useEffect,useState}=React;
+async function api(path,method='GET',body=null){
+  const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):null});
+  if(!r.ok) throw new Error(await r.text());
+  const ct=r.headers.get('content-type')||'';
+  return ct.includes('application/json')?await r.json():await r.text();
+}
+function fmtTs(ts){try{return new Date(ts*1000).toLocaleString();}catch{return String(ts)}}
+function App(){
+  const [users,setUsers]=useState([]),[inbounds,setInbounds]=useState([]),[keys,setKeys]=useState([]);
+  const [settings,setSettings]=useState({panel_domain:'',subscription_domain:'',subscription_sub_domain:''});
+  const [kLabel,setKLabel]=useState(''),[kDays,setKDays]=useState(30),[kProfile,setKProfile]=useState('balanced');
+  const [uName,setUName]=useState(''),[uPsk,setUPsk]=useState(''),[uProfile,setUProfile]=useState('balanced');
+  const [inTag,setInTag]=useState('main'),[inHost,setInHost]=useState('0.0.0.0'),[inPort,setInPort]=useState(8443);
+  const [msg,setMsg]=useState('');
+  const [theme,setTheme]=useState(localStorage.getItem('astrapanel_theme')||'light');
+  useEffect(()=>{document.body.setAttribute('data-theme',theme);localStorage.setItem('astrapanel_theme',theme);},[theme]);
+  const load=async()=>{const [a,b,c,d]=await Promise.all([api('/api/users'),api('/api/inbounds'),api('/api/access-keys'),api('/api/settings')]);setUsers(a);setInbounds(b);setKeys(c);setSettings(d);};
+  useEffect(()=>{load().catch(e=>setMsg(e.message));},[]);
+  const issue=async()=>{const r=await api('/api/access-keys','POST',{customer_label:kLabel.trim(),days:Number(kDays||30),profile:kProfile});setMsg('Issued: '+r.subscription_uri);setKLabel('');await load();};
+  const saveSettings=async()=>{await api('/api/settings','POST',settings);setMsg('Settings saved');await load();};
+  const addUser=async()=>{await api('/api/users','POST',{username:uName.trim(),psk:uPsk.trim(),profile:uProfile});setUName('');setUPsk('');await load();};
+  const addInbound=async()=>{await api('/api/inbounds','POST',{tag:inTag||'main',listen_host:inHost||'0.0.0.0',listen_port:Number(inPort||8443),transport_mode:'tcp'});await load();};
+  const cp=async t=>{await navigator.clipboard.writeText(t);setMsg('Copied');};
+  return <><div className="hero"><div className="row" style={{justifyContent:'space-between'}}><div><h1>AstraPanel React</h1><p>Production control plane: domains, automated keys, export-ready links</p></div><div><button className="alt" onClick={()=>setTheme(theme==='dark'?'light':'dark')}>{theme==='dark'?'Light mode':'Dark mode'}</button></div></div></div>
+  <div className="shell">
+    <section className="card"><h2>Automated Key Issuing</h2>
+      <div className="row"><input placeholder="Customer label" value={kLabel} onChange={e=>setKLabel(e.target.value)} style={{minWidth:260}}/>
+      <input type="number" min="1" max="3650" value={kDays} onChange={e=>setKDays(e.target.value)} style={{width:100}}/>
+      <select value={kProfile} onChange={e=>setKProfile(e.target.value)}><option>balanced</option><option>performance</option><option>stealth</option></select>
+      <button className="ok" onClick={()=>issue().catch(e=>setMsg(e.message))}>Issue Key</button></div>
+      <p className="muted">{msg}</p>
+      <table><thead><tr><th>Customer</th><th>Status</th><th>Expires</th><th>Subscription</th><th>Actions</th></tr></thead><tbody>
+      {keys.map(k=>{const j=k.sub_link.replace('format=astralink-uri','format=singbox-socks');const dl=j.replace('format=singbox-socks','format=singbox-socks-download');
+      return <tr key={k.id}><td><b>{k.customer_label}</b><div className="muted">{k.username}</div></td><td>{k.enabled?<span className="pill ok">active</span>:<span className="pill off">disabled</span>}</td><td>{fmtTs(k.expires_at)}</td><td><code>{k.sub_link}</code></td><td className="row"><button onClick={()=>cp(k.sub_link)}>Copy URI</button><button className="alt" onClick={()=>cp(j)}>Copy JSON</button><button className="alt" onClick={()=>window.open(dl,'_blank')}>Download JSON</button><button className="danger" onClick={()=>api('/api/access-keys/'+k.id,'DELETE').then(load).catch(e=>setMsg(e.message))}>Revoke</button></td></tr>})}
+      </tbody></table></section>
+    <section className="card"><h2>Domains & Routing</h2>
+      <div className="row"><input placeholder="panel.domain.com" value={settings.panel_domain||''} onChange={e=>setSettings({...settings,panel_domain:e.target.value})} style={{width:'100%'}}/></div>
+      <div className="row"><input placeholder="subs.domain.com" value={settings.subscription_domain||''} onChange={e=>setSettings({...settings,subscription_domain:e.target.value})} style={{width:'100%'}}/></div>
+      <div className="row"><input placeholder="api.subs.domain.com" value={settings.subscription_sub_domain||''} onChange={e=>setSettings({...settings,subscription_sub_domain:e.target.value})} style={{width:'100%'}}/></div>
+      <div className="row"><button onClick={()=>saveSettings().catch(e=>setMsg(e.message))}>Save Domains</button></div>
+      <hr style={{border:'none',borderTop:'1px solid #edf2f7',margin:'12px 0'}}/>
+      <h2 style={{fontSize:18}}>Inbounds</h2>
+      <div className="row"><input value={inTag} onChange={e=>setInTag(e.target.value)}/><input value={inHost} onChange={e=>setInHost(e.target.value)}/><input value={inPort} onChange={e=>setInPort(e.target.value)} style={{width:110}}/><button onClick={()=>addInbound().catch(e=>setMsg(e.message))}>Save</button></div>
+      <table><thead><tr><th>Tag</th><th>Listen</th><th>Status</th><th>Action</th></tr></thead><tbody>
+      {inbounds.map(i=><tr key={i.id}><td>{i.tag}</td><td>{i.listen_host}:{i.listen_port}</td><td>{i.enabled?'on':'off'}</td><td><button onClick={()=>api('/api/inbounds/'+i.id,'PATCH',{enabled:i.enabled?0:1}).then(load).catch(e=>setMsg(e.message))}>{i.enabled?'Disable':'Enable'}</button></td></tr>)}
+      </tbody></table></section>
+    <section className="card full"><h2>Raw Users (advanced)</h2>
+      <div className="row"><input placeholder="username" value={uName} onChange={e=>setUName(e.target.value)}/><input placeholder="psk (optional)" value={uPsk} onChange={e=>setUPsk(e.target.value)}/>
+      <select value={uProfile} onChange={e=>setUProfile(e.target.value)}><option>balanced</option><option>performance</option><option>stealth</option></select>
+      <button className="alt" onClick={()=>addUser().catch(e=>setMsg(e.message))}>Add User</button></div>
+      <table><thead><tr><th>User</th><th>PSK</th><th>Profile</th><th>Status</th><th>Action</th></tr></thead><tbody>
+      {users.map(u=><tr key={u.id}><td>{u.username}</td><td><code>{u.psk}</code></td><td>{u.profile}</td><td>{u.enabled?'on':'off'}</td><td className="row"><button onClick={()=>api('/api/users/'+u.id,'PATCH',{enabled:u.enabled?0:1}).then(load).catch(e=>setMsg(e.message))}>{u.enabled?'Disable':'Enable'}</button><button className="danger" onClick={()=>api('/api/users/'+u.id,'DELETE').then(load).catch(e=>setMsg(e.message))}>Delete</button></td></tr>)}
+      </tbody></table></section>
+  </div></>;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
 </script></body></html>"#;

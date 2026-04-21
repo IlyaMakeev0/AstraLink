@@ -1,8 +1,11 @@
 {
-  "server_host": "YOUR_SERVER_IP",
+  "server_host": "your-subscription-domain.com",
   "server_port": 8443,
-  "username": "demo",
-  "psk": "replace_with_long_random_psk",
+  "server_name": "your-subscription-domain.com",
+  "username": "replace_with_username",
+  "psk": "replace_with_psk",
   "local_socks_host": "127.0.0.1",
-  "local_socks_port": 1080
+  "local_socks_port": 1080,
+  "ca_cert_path": "transport.crt",
+  "quic_alpn": "astralink/2"
 }
