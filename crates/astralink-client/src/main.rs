@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use rand::Rng;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -7,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Deserialize, Clone)]
 struct ClientConfig {
@@ -19,6 +21,7 @@ struct ClientConfig {
     local_socks_port: u16,
     ca_cert_path: Option<String>,
     quic_alpn: Option<String>,
+    shaping: Option<ShapingConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,6 +29,27 @@ struct StreamHello {
     username: String,
     psk: String,
     target: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ShapingConfig {
+    enabled: bool,
+    min_chunk: usize,
+    max_chunk: usize,
+    max_delay_ms: u64,
+    fragment_hello: bool,
+}
+
+impl Default for ShapingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_chunk: 256,
+            max_chunk: 1400,
+            max_delay_ms: 8,
+            fragment_hello: true,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -123,6 +147,7 @@ async fn handle_socks_conn(
     conn: Arc<quinn::Connection>,
     conf: Arc<ClientConfig>,
 ) -> Result<()> {
+    let shaping = conf.shaping.clone().unwrap_or_default();
     let target = socks5_handshake_and_target(&mut local).await?;
     let (mut send, mut recv) = conn.open_bi().await.context("open quic stream")?;
     let hello = StreamHello {
@@ -131,9 +156,15 @@ async fn handle_socks_conn(
         target,
     };
     let body = serde_json::to_vec(&hello)?;
-    send.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    send.write_all(&body).await?;
-    send.flush().await?;
+    let mut hello_wire = Vec::with_capacity(4 + body.len());
+    hello_wire.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    hello_wire.extend_from_slice(&body);
+    if shaping.enabled && shaping.fragment_hello {
+        write_fragmented(&mut send, &hello_wire, &shaping).await?;
+    } else {
+        send.write_all(&hello_wire).await?;
+        send.flush().await?;
+    }
 
     let mut status = [0u8; 1];
     recv.read_exact(&mut status).await?;
@@ -162,8 +193,7 @@ async fn handle_socks_conn(
             if n == 0 {
                 break;
             }
-            send.write_all(&buf[..n]).await?;
-            send.flush().await?;
+            write_fragmented(&mut send, &buf[..n], &shaping).await?;
         }
         send.finish()?;
         Result::<()>::Ok(())
@@ -233,3 +263,33 @@ async fn socks5_handshake_and_target(local: &mut TcpStream) -> Result<String> {
 }
 
 use std::net::ToSocketAddrs;
+
+async fn write_fragmented(
+    send: &mut quinn::SendStream,
+    data: &[u8],
+    shaping: &ShapingConfig,
+) -> Result<()> {
+    if !shaping.enabled || data.is_empty() {
+        send.write_all(data).await?;
+        send.flush().await?;
+        return Ok(());
+    }
+    let mut idx = 0usize;
+    while idx < data.len() {
+        let remain = data.len() - idx;
+        let mut rng = rand::thread_rng();
+        let lo = shaping.min_chunk.max(1);
+        let hi = shaping.max_chunk.max(lo);
+        let take = remain.min(rng.gen_range(lo..=hi));
+        send.write_all(&data[idx..idx + take]).await?;
+        send.flush().await?;
+        idx += take;
+        if idx < data.len() && shaping.max_delay_ms > 0 {
+            let d = rng.gen_range(0..=shaping.max_delay_ms);
+            if d > 0 {
+                sleep(Duration::from_millis(d)).await;
+            }
+        }
+    }
+    Ok(())
+}

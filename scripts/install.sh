@@ -55,10 +55,19 @@ prompt_if_empty SUBSCRIPTION_DOMAIN "Enter subscription domain (example: sub.exa
 prompt_if_empty SUBSCRIPTION_SUB_DOMAIN "Enter priority subscription subdomain (example: api.sub.example.com, optional)"
 prompt_if_empty ACME_EMAIL "Enter email for SSL (Let's Encrypt)"
 prompt_if_empty ADMIN_PASSWORD "Enter admin password (min 8 chars)" 1
+prompt_if_empty ENABLE_FRAGMENTATION "Enable fragmentation/jitter profile for transport? (y/N)"
 
 if [[ -z "${PANEL_DOMAIN}" || -z "${SUBSCRIPTION_DOMAIN}" || -z "${ACME_EMAIL}" || -z "${ADMIN_PASSWORD}" ]]; then
   echo "Required values are missing."
   exit 1
+fi
+
+ENABLE_FRAGMENTATION="${ENABLE_FRAGMENTATION:-N}"
+ENABLE_FRAGMENTATION="$(echo "$ENABLE_FRAGMENTATION" | tr '[:upper:]' '[:lower:]')"
+if [[ "$ENABLE_FRAGMENTATION" == "y" || "$ENABLE_FRAGMENTATION" == "yes" || "$ENABLE_FRAGMENTATION" == "1" || "$ENABLE_FRAGMENTATION" == "true" ]]; then
+  SHAPING_ENABLED=true
+else
+  SHAPING_ENABLED=false
 fi
 
 mkdir -p "$APP_DIR" "$BIN_DIR" "$CFG_DIR" "$DATA_DIR"
@@ -98,6 +107,31 @@ if [[ ! -f "$CFG_DIR/transport.crt" || ! -f "$CFG_DIR/transport.key" ]]; then
     -days 3650 >/dev/null 2>&1
 fi
 
+python3 - <<PY
+import json, pathlib
+cfg_path = pathlib.Path(r"$CFG_DIR/server.json")
+if cfg_path.exists():
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+else:
+    data = {}
+data.setdefault("users", {})
+data["listen_host"] = "0.0.0.0"
+data["listen_port"] = int("$SERVER_PORT")
+data["quic_cert_path"] = "config/transport.crt"
+data["quic_key_path"] = "config/transport.key"
+data["quic_alpn"] = "astralink/2"
+data["shaping"] = {
+    "enabled": ${SHAPING_ENABLED},
+    "min_chunk": 256,
+    "max_chunk": 1400,
+    "max_delay_ms": 8
+}
+cfg_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+PY
+
 cat > "$CFG_DIR/client.example.json" <<EOF
 {
   "server_host": "$SUBSCRIPTION_DOMAIN",
@@ -108,7 +142,14 @@ cat > "$CFG_DIR/client.example.json" <<EOF
   "local_socks_host": "127.0.0.1",
   "local_socks_port": 1080,
   "ca_cert_path": "transport.crt",
-  "quic_alpn": "astralink/2"
+  "quic_alpn": "astralink/2",
+  "shaping": {
+    "enabled": $SHAPING_ENABLED,
+    "min_chunk": 256,
+    "max_chunk": 1400,
+    "max_delay_ms": 8,
+    "fragment_hello": true
+  }
 }
 EOF
 

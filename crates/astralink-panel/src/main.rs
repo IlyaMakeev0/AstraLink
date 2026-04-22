@@ -152,6 +152,16 @@ struct ApiAccessKey {
     sub_link: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ApiAuditLog {
+    id: i64,
+    admin_id: Option<i64>,
+    event: String,
+    details: String,
+    ip: String,
+    created_at: i64,
+}
+
 fn unix_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -196,6 +206,58 @@ fn parse_cookie(headers: &HeaderMap, key: &str) -> Option<String> {
             Some((k.trim(), v.trim()))
         })
         .find_map(|(k, v)| if k == key { Some(v.to_string()) } else { None })
+}
+
+fn client_ip(headers: &HeaderMap) -> String {
+    if let Some(v) = headers
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(',').next())
+    {
+        let ip = v.trim();
+        if !ip.is_empty() {
+            return ip.to_string();
+        }
+    }
+    if let Some(v) = headers
+        .get("x-real-ip")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim().to_string())
+    {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    "-".to_string()
+}
+
+fn insert_audit_log(
+    conn: &Connection,
+    admin_id: Option<i64>,
+    event: &str,
+    details: &str,
+    ip: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO audit_logs(admin_id, event, details, ip, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![admin_id, event, details, ip, unix_ts()],
+    )?;
+    Ok(())
+}
+
+fn login_is_rate_limited(conn: &Connection, ip: &str, username: &str, now: i64) -> Result<bool> {
+    let window = now - 10 * 60;
+    let failed_ip: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM login_attempts WHERE ip=?1 AND success=0 AND created_at>?2",
+        params![ip, window],
+        |r| r.get(0),
+    )?;
+    let failed_user: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM login_attempts WHERE username=?1 AND success=0 AND created_at>?2",
+        params![username, window],
+        |r| r.get(0),
+    )?;
+    Ok(failed_ip >= 12 || failed_user >= 8)
 }
 
 fn ensure_schema(db: &FsPath) -> Result<()> {
@@ -247,6 +309,24 @@ CREATE TABLE IF NOT EXISTS access_keys (
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS login_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL,
+  username TEXT NOT NULL,
+  success INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_ts ON login_attempts(ip, created_at);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_user_ts ON login_attempts(username, created_at);
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  admin_id INTEGER NULL,
+  event TEXT NOT NULL,
+  details TEXT NOT NULL,
+  ip TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 "#,
     )?;
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM inbounds", [], |r| r.get(0))?;
@@ -377,11 +457,20 @@ fn write_runtime_config(state: &AppState) -> Result<()> {
     if let Some(parent) = state.runtime_server_config.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let payload = json!({
-        "listen_host": listen_host,
-        "listen_port": listen_port,
-        "users": users
-    });
+    let mut payload = if state.runtime_server_config.exists() {
+        match std::fs::read(&state.runtime_server_config)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        {
+            Some(v) if v.is_object() => v,
+            _ => json!({}),
+        }
+    } else {
+        json!({})
+    };
+    payload["listen_host"] = serde_json::Value::String(listen_host);
+    payload["listen_port"] = serde_json::Value::Number(listen_port.into());
+    payload["users"] = serde_json::to_value(users)?;
     std::fs::write(
         &state.runtime_server_config,
         serde_json::to_vec_pretty(&payload)?,
@@ -472,14 +561,31 @@ async fn bootstrap(State(state): State<AppState>, Json(req): Json<BootstrapReq>)
     ) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+    let _ = insert_audit_log(&conn, Some(conn.last_insert_rowid()), "bootstrap_admin", "admin created", "-");
     (StatusCode::OK, "ok").into_response()
 }
 
-async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> impl IntoResponse {
+async fn login(headers: HeaderMap, State(state): State<AppState>, Json(req): Json<LoginReq>) -> impl IntoResponse {
+    let ip = client_ip(&headers);
     let conn = match Connection::open(&state.db) {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let now = unix_ts();
+    match login_is_rate_limited(&conn, &ip, &req.username, now) {
+        Ok(true) => {
+            let _ = insert_audit_log(
+                &conn,
+                None,
+                "auth_rate_limited",
+                &format!("username={}", req.username),
+                &ip,
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try later").into_response();
+        }
+        Ok(false) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
     let row: rusqlite::Result<(i64, String, String)> = conn.query_row(
         "SELECT id, salt, password_hash FROM admins WHERE username=?1",
         params![req.username],
@@ -487,11 +593,27 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> impl
     );
     let (admin_id, salt, pass_hash) = match row {
         Ok(v) => v,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "bad credentials").into_response(),
+        Err(_) => {
+            let _ = conn.execute(
+                "INSERT INTO login_attempts(ip, username, success, created_at) VALUES (?1, ?2, 0, ?3)",
+                params![ip, req.username, now],
+            );
+            let _ = insert_audit_log(&conn, None, "auth_failed", "unknown username", &ip);
+            return (StatusCode::UNAUTHORIZED, "bad credentials").into_response();
+        }
     };
     if !verify_password(&req.password, &salt, &pass_hash) {
+        let _ = conn.execute(
+            "INSERT INTO login_attempts(ip, username, success, created_at) VALUES (?1, ?2, 0, ?3)",
+            params![ip, req.username, now],
+        );
+        let _ = insert_audit_log(&conn, Some(admin_id), "auth_failed", "bad password", &ip);
         return (StatusCode::UNAUTHORIZED, "bad credentials").into_response();
     }
+    let _ = conn.execute(
+        "INSERT INTO login_attempts(ip, username, success, created_at) VALUES (?1, ?2, 1, ?3)",
+        params![ip, req.username, now],
+    );
     let token = random_psk();
     let exp = unix_ts() + 14 * 24 * 3600;
     if let Err(e) = conn.execute(
@@ -500,6 +622,7 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> impl
     ) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+    let _ = insert_audit_log(&conn, Some(admin_id), "auth_success", "login", &ip);
     let mut headers = HeaderMap::new();
     let cookie = format!(
         "astrapanel_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=1209600"
@@ -574,12 +697,18 @@ async fn create_user(
     ) {
         return (StatusCode::CONFLICT, e.to_string()).into_response();
     }
+    let _ = insert_audit_log(
+        &conn,
+        None,
+        "user_created_manual",
+        &format!("username={}", req.username.trim()),
+        &client_ip(&headers),
+    );
     {
         let _guard = state.sync_lock.lock().await;
         if let Err(e) = write_runtime_config(&state) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        maybe_restart_service(&state.restart_service);
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -600,12 +729,18 @@ async fn patch_user(
     if let Err(e) = conn.execute("UPDATE users SET enabled=?1 WHERE id=?2", params![req.enabled, id]) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+    let _ = insert_audit_log(
+        &conn,
+        None,
+        "user_toggled",
+        &format!("user_id={}, enabled={}", id, req.enabled),
+        &client_ip(&headers),
+    );
     {
         let _guard = state.sync_lock.lock().await;
         if let Err(e) = write_runtime_config(&state) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        maybe_restart_service(&state.restart_service);
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -621,12 +756,18 @@ async fn delete_user(headers: HeaderMap, Path(id): Path<i64>, State(state): Stat
     if let Err(e) = conn.execute("DELETE FROM users WHERE id=?1", params![id]) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+    let _ = insert_audit_log(
+        &conn,
+        None,
+        "user_deleted",
+        &format!("user_id={}", id),
+        &client_ip(&headers),
+    );
     {
         let _guard = state.sync_lock.lock().await;
         if let Err(e) = write_runtime_config(&state) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        maybe_restart_service(&state.restart_service);
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -709,7 +850,6 @@ async fn save_inbound(
         if let Err(e) = write_runtime_config(&state) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        maybe_restart_service(&state.restart_service);
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -735,7 +875,6 @@ async fn patch_inbound(
         if let Err(e) = write_runtime_config(&state) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        maybe_restart_service(&state.restart_service);
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -790,7 +929,54 @@ async fn save_settings(
     ) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+    let _ = insert_audit_log(
+        &conn,
+        None,
+        "settings_updated",
+        &format!(
+            "panel_domain={}, subscription_domain={}, subscription_sub_domain={}",
+            req.panel_domain, req.subscription_domain, req.subscription_sub_domain
+        ),
+        &client_ip(&headers),
+    );
     Json(json!({"ok": true})).into_response()
+}
+
+async fn list_audit_logs(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
+    if !ensure_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let conn = match Connection::open(&state.db) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, admin_id, event, details, ip, created_at FROM audit_logs ORDER BY id DESC LIMIT 300",
+    ) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok(ApiAuditLog {
+            id: r.get(0)?,
+            admin_id: r.get(1)?,
+            event: r.get(2)?,
+            details: r.get(3)?,
+            ip: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    }) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(v) => out.push(v),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    }
+    Json(out).into_response()
 }
 
 async fn list_access_keys(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
@@ -850,6 +1036,7 @@ async fn issue_access_key(
     if !ensure_auth(&headers, &state) {
         return unauthorized();
     }
+    let source_ip = client_ip(&headers);
     let label = req.customer_label.trim().to_string();
     if label.is_empty() {
         return (StatusCode::BAD_REQUEST, "customer_label is required").into_response();
@@ -866,7 +1053,7 @@ async fn issue_access_key(
     let expires_at = now + days * 24 * 3600;
 
     {
-        let mut conn = match Connection::open(&state.db) {
+        let conn = match Connection::open(&state.db) {
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
@@ -890,6 +1077,13 @@ async fn issue_access_key(
         if let Err(e) = tx.commit() {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
+        let _ = insert_audit_log(
+            &conn,
+            None,
+            "access_key_issued",
+            &format!("customer_label={}, username={}", label, username),
+            &source_ip,
+        );
     }
     {
         let _guard = state.sync_lock.lock().await;
@@ -923,6 +1117,7 @@ async fn delete_access_key(
     if !ensure_auth(&headers, &state) {
         return unauthorized();
     }
+    let source_ip = client_ip(&headers);
     let conn = match Connection::open(&state.db) {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -937,6 +1132,13 @@ async fn delete_access_key(
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     let _ = conn.execute("UPDATE users SET enabled=0 WHERE id=?1", params![uid]);
+    let _ = insert_audit_log(
+        &conn,
+        None,
+        "access_key_revoked",
+        &format!("access_key_id={}, user_id={}", id, uid),
+        &source_ip,
+    );
     {
         let _guard = state.sync_lock.lock().await;
         if let Err(e) = write_runtime_config(&state) {
@@ -1123,6 +1325,7 @@ async fn main() -> Result<()> {
         .route("/api/settings", get(get_settings).post(save_settings))
         .route("/api/access-keys", get(list_access_keys).post(issue_access_key))
         .route("/api/access-keys/:id", delete(delete_access_key))
+        .route("/api/audit-logs", get(list_audit_logs))
         .route("/api/subscription/:uuid", get(subscription))
         .route("/s/:token", get(subscription_by_token))
         .layer(middleware::from_fn(security_headers_middleware))
@@ -1197,6 +1400,7 @@ async function api(path,method='GET',body=null){
 function fmtTs(ts){try{return new Date(ts*1000).toLocaleString();}catch{return String(ts)}}
 function App(){
   const [users,setUsers]=useState([]),[inbounds,setInbounds]=useState([]),[keys,setKeys]=useState([]);
+  const [audits,setAudits]=useState([]);
   const [settings,setSettings]=useState({panel_domain:'',subscription_domain:'',subscription_sub_domain:''});
   const [kLabel,setKLabel]=useState(''),[kDays,setKDays]=useState(30),[kProfile,setKProfile]=useState('balanced');
   const [uName,setUName]=useState(''),[uPsk,setUPsk]=useState(''),[uProfile,setUProfile]=useState('balanced');
@@ -1204,7 +1408,7 @@ function App(){
   const [msg,setMsg]=useState('');
   const [theme,setTheme]=useState(localStorage.getItem('astrapanel_theme')||'light');
   useEffect(()=>{document.body.setAttribute('data-theme',theme);localStorage.setItem('astrapanel_theme',theme);},[theme]);
-  const load=async()=>{const [a,b,c,d]=await Promise.all([api('/api/users'),api('/api/inbounds'),api('/api/access-keys'),api('/api/settings')]);setUsers(a);setInbounds(b);setKeys(c);setSettings(d);};
+  const load=async()=>{const [a,b,c,d,e]=await Promise.all([api('/api/users'),api('/api/inbounds'),api('/api/access-keys'),api('/api/settings'),api('/api/audit-logs')]);setUsers(a);setInbounds(b);setKeys(c);setSettings(d);setAudits(e);};
   useEffect(()=>{load().catch(e=>setMsg(e.message));},[]);
   const issue=async()=>{const r=await api('/api/access-keys','POST',{customer_label:kLabel.trim(),days:Number(kDays||30),profile:kProfile});setMsg('Issued: '+r.subscription_uri);setKLabel('');await load();};
   const saveSettings=async()=>{await api('/api/settings','POST',settings);setMsg('Settings saved');await load();};
@@ -1241,6 +1445,11 @@ function App(){
       <table><thead><tr><th>User</th><th>PSK</th><th>Profile</th><th>Status</th><th>Action</th></tr></thead><tbody>
       {users.map(u=><tr key={u.id}><td>{u.username}</td><td><code>{u.psk}</code></td><td>{u.profile}</td><td>{u.enabled?'on':'off'}</td><td className="row"><button onClick={()=>api('/api/users/'+u.id,'PATCH',{enabled:u.enabled?0:1}).then(load).catch(e=>setMsg(e.message))}>{u.enabled?'Disable':'Enable'}</button><button className="danger" onClick={()=>api('/api/users/'+u.id,'DELETE').then(load).catch(e=>setMsg(e.message))}>Delete</button></td></tr>)}
       </tbody></table></section>
+    <section className="card full"><h2>Security Audit Log</h2>
+      <table><thead><tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr></thead><tbody>
+      {audits.map(a=><tr key={a.id}><td>{fmtTs(a.created_at)}</td><td>{a.event}</td><td>{a.ip}</td><td><code>{a.details}</code></td></tr>)}
+      </tbody></table>
+    </section>
   </div></>;
 }
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);

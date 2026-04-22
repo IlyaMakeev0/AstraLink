@@ -14,6 +14,7 @@ Protocol primitives, handshake, framing.
 
 2. `astralink-server`  
 QUIC + TLS1.3 transport server for AstraLink clients.
+- hot-reloads users from runtime config without restarting process
 
 3. `astralink-client`  
 Local SOCKS5 bridge for user devices.
@@ -27,6 +28,7 @@ API + React admin UI:
 - JSON export + JSON download for client import
 - light and dark themes
 - hardened security headers and secure cookies
+- login brute-force protection and audit log
 
 5. `Caddy`  
 Reverse proxy + automatic Let's Encrypt TLS for panel/subscription domains.
@@ -45,6 +47,7 @@ Installer will ask:
 - optional priority subscription subdomain
 - Let's Encrypt email
 - admin password
+- whether to enable fragmentation/jitter transport profile
 
 Then it automatically:
 1. installs dependencies (`git/curl/build-essential/pkg-config/caddy`)
@@ -119,6 +122,15 @@ sudo journalctl -u caddy -f
 ```
 
 Client must trust the generated `transport.crt`.
+
+## Fragmentation / Stealth Profile
+
+Both server and client support optional traffic shaping:
+- random chunk fragmentation
+- small inter-chunk jitter delay
+- optional hello fragmentation (client)
+
+Configure in JSON under `shaping`.
 
 ## Local build (dev)
 

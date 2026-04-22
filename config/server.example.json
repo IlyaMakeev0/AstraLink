@@ -4,6 +4,12 @@
   "quic_cert_path": "config/transport.crt",
   "quic_key_path": "config/transport.key",
   "quic_alpn": "astralink/2",
+  "shaping": {
+    "enabled": false,
+    "min_chunk": 256,
+    "max_chunk": 1400,
+    "max_delay_ms": 8
+  },
   "users": {
     "demo": "replace_with_long_random_psk"
   }

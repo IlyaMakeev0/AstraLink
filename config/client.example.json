@@ -7,5 +7,12 @@
   "local_socks_host": "127.0.0.1",
   "local_socks_port": 1080,
   "ca_cert_path": "transport.crt",
-  "quic_alpn": "astralink/2"
+  "quic_alpn": "astralink/2",
+  "shaping": {
+    "enabled": false,
+    "min_chunk": 256,
+    "max_chunk": 1400,
+    "max_delay_ms": 8,
+    "fragment_hello": true
+  }
 }
