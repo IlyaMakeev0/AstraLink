@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("read config {:?}", args.config))?;
     let conf: ServerConfig = serde_json::from_slice(&raw).context("parse config json")?;
     if conf.users.is_empty() {
-        bail!("users map is empty");
+        eprintln!("[*] warning: users map is empty; waiting for runtime users update");
     }
 
     let cert_path = conf
