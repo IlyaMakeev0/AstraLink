@@ -262,15 +262,14 @@ async fn write_fragmented(
     let mut idx = 0usize;
     while idx < data.len() {
         let remain = data.len() - idx;
-        let mut rng = rand::thread_rng();
         let lo = shaping.min_chunk.max(1);
         let hi = shaping.max_chunk.max(lo);
-        let take = remain.min(rng.gen_range(lo..=hi));
+        let take = remain.min(rand::thread_rng().gen_range(lo..=hi));
         send.write_all(&data[idx..idx + take]).await?;
         send.flush().await?;
         idx += take;
         if idx < data.len() && shaping.max_delay_ms > 0 {
-            let d = rng.gen_range(0..=shaping.max_delay_ms);
+            let d = rand::thread_rng().gen_range(0..=shaping.max_delay_ms);
             if d > 0 {
                 sleep(Duration::from_millis(d)).await;
             }
