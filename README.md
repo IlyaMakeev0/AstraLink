@@ -1,4 +1,4 @@
-# AstraLink v2 (Rust + React + Auto-SSL)
+# AstraLink (Rust + React + Auto-SSL)
 
 Production-oriented VPN control plane stack:
 - Rust protocol core/server/client
