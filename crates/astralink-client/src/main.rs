@@ -60,6 +60,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
     let raw = tokio::fs::read(&args.config)
         .await
