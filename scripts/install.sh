@@ -123,8 +123,9 @@ data["listen_port"] = int("$SERVER_PORT")
 data["quic_cert_path"] = "config/transport.crt"
 data["quic_key_path"] = "config/transport.key"
 data["quic_alpn"] = "astralink/2"
+shaping_enabled = "${SHAPING_ENABLED}".lower() in ("1", "true", "yes", "y")
 data["shaping"] = {
-    "enabled": ${SHAPING_ENABLED},
+    "enabled": shaping_enabled,
     "min_chunk": 256,
     "max_chunk": 1400,
     "max_delay_ms": 8
@@ -177,13 +178,17 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$APP_DIR
-ExecStart=$BIN_DIR/astralink-panel --host 127.0.0.1 --port $PANEL_PORT_LOCAL --db $DATA_DIR/panel.db --runtime-server-config $CFG_DIR/server.json --restart-service astralink-server --public-host $SUBSCRIPTION_DOMAIN --public-port $SERVER_PORT --panel-domain $PANEL_DOMAIN --subscription-domain $SUBSCRIPTION_DOMAIN --subscription-sub-domain $SUBSCRIPTION_SUB_DOMAIN
+ExecStart=$BIN_DIR/astralink-panel --host 127.0.0.1 --port $PANEL_PORT_LOCAL --db $DATA_DIR/panel.db --runtime-server-config $CFG_DIR/server.json --restart-service astralink-server --public-host $SUBSCRIPTION_DOMAIN --public-port $SERVER_PORT --panel-domain $PANEL_DOMAIN --subscription-domain $SUBSCRIPTION_DOMAIN
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+if [[ -n "$SUBSCRIPTION_SUB_DOMAIN" ]]; then
+  sed -i "s#--subscription-domain $SUBSCRIPTION_DOMAIN#--subscription-domain $SUBSCRIPTION_DOMAIN --subscription-sub-domain $SUBSCRIPTION_SUB_DOMAIN#g" "$SYSTEMD_DIR/astralink-panel.service"
+fi
 
 cat > /etc/caddy/Caddyfile <<EOF
 {
